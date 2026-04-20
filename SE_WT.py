@@ -1,0 +1,111 @@
+import torch
+import torch.nn as nn
+from wtconv.wtconv2d import WTConv2d
+
+
+class SE_Block(nn.Module):
+    def __init__(self, c, r=16):
+        super().__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(c, c // r, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c // r, c, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        bs, c, _, _ = x.shape
+        y = self.squeeze(x).view(bs, c)
+        y = self.excitation(y).view(bs, c, 1, 1)
+        return x * y.expand_as(x)
+
+class SEResnet(nn.Module):
+    def __init__(self, chanel_in, chanel_out, stride, padding=1, r=16):
+        super().__init__()
+        self.sequence = nn.Sequential(
+            nn.Conv2d(chanel_in, chanel_out, kernel_size=3, stride=stride, padding=padding),
+            nn.BatchNorm2d(chanel_out),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(chanel_out, chanel_out, kernel_size=3, stride=stride, padding=padding),
+            nn.BatchNorm2d(chanel_out),
+            SE_Block(chanel_out, r)
+        )
+        self.ReLU = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        out = self.sequence(x)
+        out += x
+        out = self.ReLU(out)
+        return out
+
+class conv3x3_bn_relu(nn.Module):
+    def __init__(self, chanel_in, chanel_out, stride, padding=1):
+        super().__init__()
+        self.sequence = nn.Sequential(
+            nn.Conv2d(chanel_in, chanel_out, kernel_size=3, stride=stride, padding=padding),
+            nn.BatchNorm2d(chanel_out),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.sequence(x)
+
+class down(nn.Module):
+    def __init__(self, chanel_in, chanel_out, stride, padding=1, pooling=True, r=16):
+        super().__init__()
+        self.conv = nn.Sequential(
+            conv3x3_bn_relu(chanel_in, chanel_out, stride, padding),
+            WTConv2d(chanel_out, chanel_out, kernel_size=3, wt_levels=4),
+            SEResnet(chanel_out, chanel_out, stride, padding, r),
+            SEResnet(chanel_out, chanel_out, stride, padding, r),
+        )
+        self.max_pooling = nn.MaxPool2d(2) if pooling else nn.Identity()
+
+    def forward(self, x):
+        return self.conv(self.max_pooling(x))
+
+
+class up(nn.Module):
+    def __init__(self, chanel_in, chanel_out, stride=1, padding=1, bilinear=True):
+        super().__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = nn.Sequential(
+                conv3x3_bn_relu(chanel_in + chanel_in // 2, chanel_out, stride, padding),
+            )
+        else:
+            self.up = nn.ConvTranspose2d(chanel_in, chanel_in // 2, kernel_size=2, stride=stride)
+            self.conv = nn.Sequential(
+                conv3x3_bn_relu(chanel_in, chanel_out, stride, padding),
+            )
+
+    def forward(self, x1, x2):
+        x2 = self.up(x2)
+        return self.conv(torch.cat([x1, x2], dim=1))
+
+class SE_WT(nn.Module):
+    def __init__(self, n_channel=1, n_class=1, bilinear=True):
+        super().__init__()
+        self.down1 = down(n_channel, 12, 1, pooling=False)
+        self.down2 = down(12, 24, 1)
+        self.down3 = down(24, 48, 1)
+        self.down4 = down(48, 96, 1)
+        self.down5 = down(96, 192, 1)
+        self.up1 = up(96 * 2, 96, 1, bilinear=bilinear)
+        self.up2 = up(48 * 2, 48, 1, bilinear=bilinear)
+        self.up3 = up(24 * 2, 24, 1, bilinear=bilinear)
+        self.up4 = up(12 * 2, 12, 1, bilinear=bilinear)
+        self.final = nn.Conv2d(12, n_class, 1)
+
+    def forward(self, x):
+        x1 = self.down1(x)
+        x2 = self.down2(x1)
+        x3 = self.down3(x2)
+        x4 = self.down4(x3)
+        x5 = self.down5(x4)
+        x = self.up1(x4, x5)
+        x = self.up2(x3, x)
+        x = self.up3(x2, x)
+        x = self.up4(x1, x)
+        return self.final(x)
